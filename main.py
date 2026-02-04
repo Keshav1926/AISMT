@@ -20,7 +20,7 @@ app.add_middleware(
 
 # Initialize Gemini Client 
 # Make sure to set API_KEY in your environment variables before running 
-api_key = "AIzaSyCiXHXWpkp0htMMlA6Hdf0EQzsW-oQUfVs"
+api_key = os.getenv("GOOGLE_API_KEY")
 if not api_key:
     print("Warning: API_KEY not found in environment variables.")
 
@@ -108,5 +108,6 @@ async def analyze_audio(file: UploadFile = File(...)):
 
 if __name__ == "__main__":
     import uvicorn
+
 
     uvicorn.run(app, host="0.0.0.0", port=8000)
