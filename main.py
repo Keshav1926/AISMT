@@ -1,15 +1,30 @@
 import os
+import base64
 import json
-from typing import List, Literal
-from fastapi import FastAPI, UploadFile, File, HTTPException
+from typing import Literal
+from fastapi import FastAPI, HTTPException, Security, Depends
+from fastapi.security.api_key import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from google import genai
 from google.genai import types
 
+# --- Configuration & Security ---
+API_KEY_NAME = "x-api-key"
+# Replace with your actual secret key or set as env var
+VALID_API_KEY = os.getenv("APP_SECRET_KEY", "sk_test_123456789")
+api_key_header = APIKeyHeader(name=API_KEY_NAME, auto_error=False)
+
+async def get_api_key(api_key: str = Security(api_key_header)):
+    if api_key == VALID_API_KEY:
+        return api_key
+    raise HTTPException(
+        status_code=403, 
+        detail={"status": "error", "message": "Invalid API key or malformed request"}
+    )
+
 app = FastAPI(title="DeepVoice Detective API")
 
-# Configure CORS to allow requests from your frontend 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,96 +33,86 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Initialize Gemini Client 
-# Make sure to set API_KEY in your environment variables before running 
-api_key = os.getenv("GOOGLE_API_KEY")
-if not api_key:
-    print("Warning: API_KEY not found in environment variables.")
+# Initialize Gemini Client
+gemini_api_key = os.getenv("GOOGLE_API_KEY")
+client = genai.Client(api_key=gemini_api_key)
 
-client = genai.Client(api_key=api_key)
+# --- Pydantic Models ---
 
+class AnalysisRequest(BaseModel):
+    language: Literal['Tamil', 'English', 'Hindi', 'Malayalam', 'Telugu']
+    audioFormat: Literal['mp3']
+    audioBase64: str
 
-# Define the response schema using Pydantic
-class AnalysisResult(BaseModel):
-    detectedLanguage: str
-    classification: Literal['AI-Generated', 'Human-Generated', 'Uncertain']
-    confidence: float
+class AnalysisResponse(BaseModel):
+    status: str = "success"
+    language: str
+    classification: Literal['AI_GENERATED', 'HUMAN']
+    confidenceScore: float
     explanation: str
-    artifacts: List[str]
 
+# --- API Endpoints ---
 
-@app.post("/analyze", response_model=AnalysisResult)
-async def analyze_audio(file: UploadFile = File(...)):
-    """ 
-    Analyzes an uploaded audio file to detect deepfakes and identify the language. 
+@app.post("/api/voice-detection", response_model=AnalysisResponse)
+async def analyze_voice(request: AnalysisRequest, api_key: str = Depends(get_api_key)):
+    """
+    Accepts Base64 MP3, validates language, and detects AI vs Human voice.
     """
     try:
-        # Read the file content 
-        content = await file.read()
+        # 1. Decode Base64 Audio
+        try:
+            audio_bytes = base64.b64decode(request.audioBase64)
+        except Exception:
+            raise HTTPException(status_code=400, detail={"status": "error", "message": "Invalid Base64 string"})
 
-        # Default to audio/mp3 if content_type is missing 
-        mime_type = file.content_type or "audio/mp3"
+        # 2. Prepare the prompt (keeping the persona but updating output requirements)
+        prompt = f"""
+        Act as an expert forensic audio analyst specializing in synthetic speech detection.
+        Analyze this audio sample which is provided in {request.language}.
 
-        prompt = """ 
-        Act as an expert forensic audio analyst specializing in synthetic speech detection (Deepfake detection). 
+        Task:
+        - Determine if the voice is AI_GENERATED (synthetic) or HUMAN (organic).
+        - Check for: metallic timbres, spectral cutoffs, lack of breath, or unnatural prosody.
+        - Look for: natural hesitations, emotional nuances, and environmental noise consistency.
 
-        Analyze the provided audio sample. 
-
-        Your task: 
-        1. **Identify the language**: Detect the spoken language (e.g., Tamil, English, Hindi, Malayalam, Telugu). 
-        2. **Listen critically** for artifacts common in AI-generated speech, such as: 
-            - Unnatural breathing patterns or lack of breathing. 
-            - Metallic or robotic robotic timbres. 
-            - Inconsistent ambient noise or "spectral cutoffs". 
-            - Mispronunciations or unnatural prosody specific to the detected language. 
-            - Pitch flattening or perfect pitch stability (which is unnatural for humans). 
-        3. **Listen for human characteristics**: 
-            - Natural pauses, hesitations (umm, ahh), and breathing. 
-            - Emotional nuance and dynamic range. 
-            - Environmental consistency. 
-
-        Return a JSON object with the following fields: 
-        - detectedLanguage: The language you identified (e.g., "Tamil", "English"). 
-        - classification: "AI-Generated" or "Human-Generated" or "Uncertain". 
-        - confidence: A number between 0 and 100 representing your certainty. 
-        - explanation: A concise summary of why you made this decision (max 50 words). 
-        - artifacts: A list of specific auditory features you observed (e.g., "Metallic timbre", "Natural breathing"). 
+        Return ONLY a JSON object:
+        - language: "{request.language}"
+        - classification: "AI_GENERATED" or "HUMAN"
+        - confidenceScore: A float between 0.0 and 1.0.
+        - explanation: A concise summary (max 50 words).
         """
 
-        # Call Gemini API 
+        # 3. Call Gemini API
         response = client.models.generate_content(
-            model= 'gemini-3-flash-preview' ,#'gemini-2.0-flash',  # Or 'gemini-3-flash-preview' if available
+            model='gemini-3-flash-preview', 
             contents=[
                 types.Content(
                     parts=[
-                        types.Part.from_bytes(data=content, mime_type=mime_type),
+                        types.Part.from_bytes(data=audio_bytes, mime_type="audio/mp3"),
                         types.Part.from_text(text=prompt)
                     ]
                 )
             ],
             config=types.GenerateContentConfig(
                 response_mime_type="application/json",
-                response_schema=AnalysisResult
+                response_schema=AnalysisResponse
             )
         )
 
         if not response.text:
-            raise HTTPException(status_code=502, detail="Empty response from Gemini API")
+            raise HTTPException(status_code=502, detail="Empty response from AI engine")
 
-            # Parse and return
-        try:
-            result = json.loads(response.text)
-            return result
-        except json.JSONDecodeError:
-            raise HTTPException(status_code=502, detail="Invalid JSON from Gemini API")
+        # 4. Parse and return result
+        result_data = json.loads(response.text)
+        return result_data
 
     except Exception as e:
-        print(f"Error processing request: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
-
+        # Standardize error format as per requirements
+        raise HTTPException(
+            status_code=500, 
+            detail={"status": "error", "message": str(e)}
+        )
 
 if __name__ == "__main__":
     import uvicorn
-
-
     uvicorn.run(app, host="0.0.0.0", port=8000)
